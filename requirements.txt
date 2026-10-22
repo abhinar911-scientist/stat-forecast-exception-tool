@@ -1,0 +1,7 @@
+streamlit>=1.40,<2
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1
+python-calamine>=0.2        # optional: ~6x faster xlsx reads, falls back to openpyxl
+plotly>=5.22
+bcrypt>=4.1
