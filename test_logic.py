@@ -108,8 +108,11 @@ def test_filters_cascade_and_empty_means_all():
 
 def test_missing_column_raises_data_error():
     bad = pd.DataFrame([_row()]).drop(columns=[D.COL_STF_L1])
-    with pytest.raises(D.DataError, match="missing these required columns"):
+    with pytest.raises(D.DataError) as err:
         D.prepare(bad)
+    assert "does not look like the Arkieva" in str(err.value)
+    assert D.COL_STF_L1 not in str(err.value)      # never leak column names to the UI
+    assert D.COL_STF_L1 in err.value.detail        # but keep them for the logs
 
 
 def test_null_lag_values_are_zero_filled():
@@ -202,3 +205,64 @@ def test_zero_change_rows_are_excluded_from_the_exception_table():
     assert list(out[D.COL_MATERIAL]) == ["MOVED__1"]
     assert len(D.exception_table(df, [D.COL_MATERIAL], 30, only_changed=False)) == 2
     assert D.changed_group_count(df, [D.COL_MATERIAL]) == 1
+
+
+def test_kpis_net_and_gross_are_computed_on_aggregates():
+    """A rise and an equal fall inside one combination nets to zero but is churn."""
+    rows = [
+        _row(**{D.COL_MONTH: pd.Timestamp("2026-11-01"), D.COL_STF: 150.0, D.COL_STF_L1: 100.0}),
+        _row(**{D.COL_MONTH: pd.Timestamp("2026-12-01"), D.COL_STF: 50.0, D.COL_STF_L1: 100.0}),
+        _row(**{D.COL_MATERIAL: "OTHER__2", D.COL_SHIPTO: "Ship B__2",
+                D.COL_STF: 300.0, D.COL_STF_L1: 200.0}),
+    ]
+    k = D.kpis(frame(rows))
+    assert k["stat_forecast"] == 500.0
+    assert k["lag1_forecast"] == 400.0
+    assert k["net_delta"] == 100.0
+    assert k["net_delta_pct"] == pytest.approx(0.25)
+    # combination 1 nets to zero, combination 2 moved 100 -> gross is 100, not 200
+    assert k["gross_delta"] == 100.0
+    assert k["combos"] == 2
+    assert k["combos_changed"] == 1
+
+
+def test_kpis_ignore_floating_point_residue():
+    rows = [_row(**{D.COL_STF: 100.0000001, D.COL_STF_L1: 100.0})]
+    k = D.kpis(frame(rows))
+    assert k["combos_changed"] == 0
+
+
+def test_material_code_split_keeps_the_full_description():
+    df = frame([_row(**{D.COL_MATERIAL: "AG 6202 210 KG PTH DR__8003955"})])
+    out = D.split_material(D.exception_table(df, [D.COL_MATERIAL], 5))
+    assert out[D.COL_MAT_CODE].iloc[0] == "8003955"
+    assert out[D.COL_MATERIAL].iloc[0] == "AG 6202 210 KG PTH DR"
+
+
+def test_material_code_is_blank_when_there_is_no_code():
+    assert D.material_code("PLAIN NAME") == ""
+
+
+def test_exhibit_flags_only_rows_above_the_threshold():
+    import tables
+    rows = [
+        _row(**{D.COL_MATERIAL: "HOT__1", D.COL_STF: 200.0, D.COL_STF_L1: 100.0}),   # 100%
+        _row(**{D.COL_MATERIAL: "MILD__2", D.COL_STF: 101.0, D.COL_STF_L1: 100.0}),  # 1%
+    ]
+    tbl = D.split_material(D.exception_table(frame(rows), [D.COL_MATERIAL], 30))
+    html = tables.exhibit(tbl, [D.COL_MAT_CODE, D.COL_MATERIAL, D.COL_STF,
+                                D.COL_STF_L1, D.COL_DELTA, D.COL_DELTA_PCT],
+                          kicker="Exhibit 1", title="t", subtitle="s", threshold=0.05)
+    assert html.count('flag"') == 2          # delta kg + delta % of the hot row only
+    assert "1 of 2 rows" in html
+
+
+def test_new_combinations_are_flagged_and_labelled():
+    import tables
+    rows = [_row(**{D.COL_MATERIAL: "NEW__1", D.COL_STF: 900.0, D.COL_STF_L1: 0.0})]
+    tbl = D.split_material(D.exception_table(frame(rows), [D.COL_MATERIAL], 30))
+    html = tables.exhibit(tbl, [D.COL_MATERIAL, D.COL_DELTA, D.COL_DELTA_PCT],
+                          kicker="k", title="t", subtitle="s", threshold=0.05)
+    assert ">new<" in html
+    assert html.count('flag') >= 2
+    assert "1 of 1 rows" in html

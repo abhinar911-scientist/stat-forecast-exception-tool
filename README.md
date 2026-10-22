@@ -50,7 +50,15 @@ and the delta is taken on the aggregate — so a +500 kg move in March and a
 double-counting.
 
 - `Absolute Delta vs Lag 1 (kg)` = `|Σ Statistical Forecast − Σ Committed Lag 1|`
-- `Delta % vs Lag 1` = `Absolute Delta ÷ |Σ Committed Lag 1|`, blank when lag 1 is zero
+- `Delta % vs Lag 1` = `Absolute Delta ÷ |Σ Committed Lag 1|`; shown as `new`
+  when lag 1 is zero, and such rows are flagged
+- Scorecards follow the same rule. **Net change** is the portfolio total minus
+  the lag 1 total; **% change** is that over lag 1; **Gross change** totals each
+  Material × Ship To combination over the horizon first and then sums the
+  absolute changes, so offsetting months inside one combination are not counted
+  twice. Movements below 0.5 kg are floating-point residue and are ignored.
+- Deltas above 5% of lag 1 are shaded in both tables; change `DELTA_THRESHOLD`
+  in `app.py` to move that line.
 - Tables are ranked by absolute kg (volume weighted), largest first, and rows
   with no movement are dropped — an exception list only carries exceptions.
 - Change categories compare this month's Arkieva segmentation with last
@@ -202,7 +210,9 @@ auth.py                    bcrypt login gate
 scripts/hash_password.py   password hash generator
 scripts/make_sample_data.py synthetic demo export generator
 sample/                    synthetic demo export
+tables.py                  exhibit-style HTML tables
 tests/test_logic.py        unit tests for every metric rule
+USER_GUIDE.md              how to run the monthly review with this tool
 .streamlit/config.toml     theme and upload limit (200 MB)
 .streamlit/secrets.toml    users — local only, never committed
 ```

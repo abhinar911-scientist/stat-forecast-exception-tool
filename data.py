@@ -38,6 +38,11 @@ COL_DELTA = "Absolute Delta vs Lag 1 (kg)"
 COL_DELTA_PCT = "Delta % vs Lag 1"
 COL_SIGNED = "Signed Delta vs Lag 1 (kg)"
 COL_CATEGORY = "Segmentation Change Category"
+COL_MAT_CODE = "Material Code"
+
+# Forecast engines leave floating-point residue; anything under this many kg is
+# not a real change and must not be counted as an exception.
+KG_TOLERANCE = 0.5
 
 FILTER_COLUMNS = [COL_BL, COL_PL, COL_MATERIAL, COL_REGION, COL_REVIEW,
                   COL_ABC, COL_VAR, COL_STATUS, COL_PARENT]
@@ -53,15 +58,27 @@ CAT_STATUS = "Status Change"
 CAT_BOTH = "Status and Pattern Change"
 CATEGORY_ORDER = [CAT_NO_CHANGE, CAT_PATTERN, CAT_STATUS, CAT_BOTH]
 CATEGORY_COLORS = {
-    CAT_NO_CHANGE: "#1F4E99",   # deep blue
-    CAT_PATTERN: "#1F9E6E",     # green
-    CAT_STATUS: "#7B3F9E",      # purple
-    CAT_BOTH: "#3FBFAE",        # teal
+    CAT_NO_CHANGE: "#1c5a92",   # navy
+    CAT_PATTERN: "#2a9d8f",     # teal
+    CAT_STATUS: "#7b5ea7",      # violet
+    CAT_BOTH: "#c98a2b",        # amber
 }
 
 
 class DataError(Exception):
-    """Raised when the uploaded workbook cannot be used."""
+    """Raised when the uploaded workbook cannot be used.
+
+    ``detail`` carries the technical reason for the logs; ``args[0]`` is what the
+    user sees and deliberately never names the report's columns.
+    """
+
+    def __init__(self, message: str, detail: str = ""):
+        super().__init__(message)
+        self.detail = detail or message
+
+
+def user_message(exc: Exception) -> str:
+    return str(exc)
 
 
 # ------------------------------------------------------------- loading ------
@@ -118,8 +135,10 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise DataError(
-            "The uploaded file is missing these required columns: "
-            + ", ".join(missing)
+            f"This does not look like the Arkieva Statistical Forecast Exception "
+            f"list export — {len(missing)} expected field(s) are missing. Please "
+            f"re-run the standard report and upload it again.",
+            detail="missing columns: " + ", ".join(missing),
         )
     df = df[REQUIRED_COLUMNS]
 
@@ -145,6 +164,7 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     for c in (COL_STF, COL_STF_L1):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
+    df[COL_MAT_CODE] = df[COL_MATERIAL].map(material_code)
     df[COL_SIGNED] = df[COL_STF] - df[COL_STF_L1]
     df[COL_DELTA] = df[COL_SIGNED].abs()
     df[COL_CATEGORY] = categorise(df)
@@ -237,7 +257,7 @@ def exception_table(df: pd.DataFrame, group_cols: list[str],
              .sum().reset_index())
     agg = _finish(agg)
     if only_changed:
-        agg = agg[agg[COL_DELTA] > 0]
+        agg = agg[agg[COL_DELTA] > KG_TOLERANCE]
     agg = agg.sort_values(COL_DELTA, ascending=False, kind="mergesort")
     cols = group_cols + [COL_STF, COL_STF_L1, COL_DELTA, COL_DELTA_PCT]
     return agg[cols].head(top_n).reset_index(drop=True)
@@ -248,7 +268,7 @@ def changed_group_count(df: pd.DataFrame, group_cols: list[str]) -> int:
     if df.empty:
         return 0
     agg = df.groupby(group_cols, observed=True, dropna=False)[[COL_STF, COL_STF_L1]].sum()
-    return int(((agg[COL_STF] - agg[COL_STF_L1]).abs() > 0).sum())
+    return int(((agg[COL_STF] - agg[COL_STF_L1]).abs() > KG_TOLERANCE).sum())
 
 
 def monthly_trend(df: pd.DataFrame) -> pd.DataFrame:
@@ -260,48 +280,89 @@ def monthly_trend(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def material_change_mix(df: pd.DataFrame, top_n: int = 30) -> tuple[pd.DataFrame, list[str]]:
-    """Top N materials by total kg of forecast change, split by category.
+    """Top N materials by kg of forecast change, split by segmentation category.
 
-    Returns the stacked frame (Material, Category, kg) and the material order
-    (highest total change first).
+    Like every other measure here the delta is taken on the aggregate: months
+    are summed per Material x Category first, then the absolute change is read
+    off that total.
     """
     empty = pd.DataFrame(columns=[COL_MATERIAL, COL_CATEGORY, COL_DELTA])
     if df.empty:
         return empty, []
-    totals = (df.groupby(COL_MATERIAL, observed=True)[COL_DELTA]
-                .sum().sort_values(ascending=False))
-    totals = totals[totals > 0]
-    order = totals.head(top_n).index.tolist()
-    if not order:
+
+    mix = (df.groupby([COL_MATERIAL, COL_CATEGORY], observed=False)[[COL_STF, COL_STF_L1]]
+             .sum().reset_index())
+    mix[COL_DELTA] = (mix[COL_STF] - mix[COL_STF_L1]).abs()
+    mix = mix[mix[COL_DELTA] > KG_TOLERANCE]
+    if mix.empty:
         return empty, []
-    sub = df[df[COL_MATERIAL].isin(order)]
-    mix = (sub.groupby([COL_MATERIAL, COL_CATEGORY], observed=False)[COL_DELTA]
-              .sum().reset_index())
-    mix = mix[mix[COL_DELTA] > 0]
-    return mix, order
+
+    totals = (mix.groupby(COL_MATERIAL, observed=True)[COL_DELTA]
+                 .sum().sort_values(ascending=False))
+    order = totals.head(top_n).index.tolist()
+    mix = mix[mix[COL_MATERIAL].isin(order)]
+    return mix[[COL_MATERIAL, COL_CATEGORY, COL_DELTA]], order
 
 
 def kpis(df: pd.DataFrame) -> dict:
-    stf = float(df[COL_STF].sum()) if not df.empty else 0.0
-    lag = float(df[COL_STF_L1].sum()) if not df.empty else 0.0
-    abs_delta = float(df[COL_DELTA].sum()) if not df.empty else 0.0
-    combos = int(df.groupby([COL_MATERIAL, COL_SHIPTO], observed=True).ngroups) if not df.empty else 0
-    changed = 0
-    if not df.empty:
-        per_combo = df.groupby([COL_MATERIAL, COL_SHIPTO], observed=True)[COL_DELTA].sum()
-        changed = int((per_combo > 0).sum())
+    """Headline numbers for the current scope.
+
+    Every figure is computed on aggregates, never on raw rows:
+
+    * ``net_delta`` is the portfolio total this month minus the total committed
+      last month — the volume the plan actually moved by.
+    * ``gross_delta`` sums the absolute change of each Material x Ship To
+      combination **after** its months are added up, so a rise in March and an
+      equal fall in April inside one combination net out instead of being
+      counted twice. This is the churn behind a small net number.
+    * ``combos_changed`` counts combinations that moved by more than
+      ``KG_TOLERANCE`` kg, which keeps floating-point residue out of the count.
+    """
+    blank = {"stat_forecast": 0.0, "lag1_forecast": 0.0, "net_delta": 0.0,
+             "net_delta_pct": float("nan"), "gross_delta": 0.0,
+             "gross_delta_pct": float("nan"), "combos": 0, "combos_changed": 0}
+    if df.empty:
+        return blank
+
+    stf = float(df[COL_STF].sum())
+    lag = float(df[COL_STF_L1].sum())
+    net = stf - lag
+
+    combo = df.groupby([COL_MATERIAL, COL_SHIPTO], observed=True)[[COL_STF, COL_STF_L1]].sum()
+    combo_delta = (combo[COL_STF] - combo[COL_STF_L1]).abs()
+    gross = float(combo_delta.sum())
+
     return {
         "stat_forecast": stf,
         "lag1_forecast": lag,
-        "net_delta": stf - lag,
-        "abs_delta": abs_delta,
-        "abs_delta_pct": (abs_delta / abs(lag)) if lag else float("nan"),
-        "combos": combos,
-        "combos_changed": changed,
+        "net_delta": net,
+        "net_delta_pct": (net / abs(lag)) if lag else float("nan"),
+        "gross_delta": gross,
+        "gross_delta_pct": (gross / abs(lag)) if lag else float("nan"),
+        "combos": int(len(combo)),
+        "combos_changed": int((combo_delta > KG_TOLERANCE).sum()),
     }
 
 
 # ------------------------------------------------------------- display ------
+
+def material_code(value: str) -> str:
+    """'AG 6202 210 KG PTH DR__8003955' -> '8003955'."""
+    if isinstance(value, str) and "__" in value:
+        return value.rsplit("__", 1)[1].strip()
+    return ""
+
+
+def split_material(table: pd.DataFrame) -> pd.DataFrame:
+    """Give the table a Material Code column and leave the description intact."""
+    if COL_MATERIAL not in table.columns:
+        return table
+    out = table.copy()
+    codes = out[COL_MATERIAL].map(material_code)
+    out[COL_MATERIAL] = out[COL_MATERIAL].map(short_name)
+    out.insert(out.columns.get_loc(COL_MATERIAL), COL_MAT_CODE, codes)
+    return out
+
 
 def short_name(value: str) -> str:
     """'Cleaning__BL02' -> 'Cleaning'; leaves plain values untouched."""

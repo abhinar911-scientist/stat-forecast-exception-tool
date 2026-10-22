@@ -13,6 +13,7 @@ import streamlit as st
 import auth
 import charts
 import data as D
+import tables
 
 st.set_page_config(
     page_title="Statistical Forecast Exception List",
@@ -34,6 +35,7 @@ CUSTOM_CSS = """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 TOP_N = 30
+DELTA_THRESHOLD = 0.05   # flag a change above 5% vs lag 1
 
 FILTER_SPECS = [
     (D.COL_BL, "Business Line"),
@@ -94,7 +96,11 @@ def sidebar_controls(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         selections[col] = chosen
 
     st.sidebar.divider()
-    st.sidebar.toggle("Short names (strip codes)", value=True, key="short_names")
+    st.sidebar.toggle(
+        "Short names for Business / Product Line", value=True, key="short_names",
+        help="Strips the trailing __CODE from Business Line, Product Line and "
+             "Parent Customer. Material always shows its code in its own column.",
+    )
     st.sidebar.toggle(
         "Ignore moves between unclassified codes", value=True,
         key="merge_placeholders",
@@ -133,46 +139,57 @@ def horizon_slider(df: pd.DataFrame):
 
 def kpi_row(scoped: pd.DataFrame) -> None:
     k = D.kpis(scoped)
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Statistical Forecast", f"{k['stat_forecast']:,.0f} kg")
     c2.metric("Committed Lag 1", f"{k['lag1_forecast']:,.0f} kg")
-    c3.metric("Net change", f"{k['net_delta']:,.0f} kg")
-    pct = k["abs_delta_pct"]
-    c4.metric("Absolute change", f"{k['abs_delta']:,.0f} kg",
-              help="Sum of |current − lag 1| across every row in scope.")
-    c5.metric("Combinations changed",
+    c3.metric("Net change", f"{k['net_delta']:+,.0f} kg",
+              help="Total statistical forecast minus total committed lag 1 over "
+                   "the selected horizon. Increases and decreases offset, so a "
+                   "small number here can still hide a lot of movement.")
+    net_pct = k["net_delta_pct"]
+    c4.metric("% change",
+              f"{net_pct * 100:+.2f}%" if pd.notna(net_pct) else "n/a",
+              help="Net change as a share of the committed lag 1 volume.")
+    gross_pct = k["gross_delta_pct"]
+    c5.metric("Gross change", f"{k['gross_delta']:,.0f} kg",
+              delta=f"{gross_pct * 100:.2f}% of lag 1" if pd.notna(gross_pct) else None,
+              delta_color="off",
+              help="Each Material x Ship To combination is totalled over the "
+                   "horizon first, then its absolute change is added up. This is "
+                   "the churn underneath the net number.")
+    c6.metric("Combinations changed",
               f"{k['combos_changed']:,} / {k['combos']:,}",
-              delta=f"{(pct * 100):.1f}% abs vs lag 1" if pd.notna(pct) else None,
-              delta_color="off")
+              help=f"Combinations whose horizon total moved by more than "
+                   f"{D.KG_TOLERANCE} kg.")
 
 
-def _table_config(group_cols: list[str]) -> dict:
-    cfg = {
-        D.COL_STF: st.column_config.NumberColumn("Stat Forecast (kg)", format="%,.0f"),
-        D.COL_STF_L1: st.column_config.NumberColumn("Committed Lag 1 (kg)", format="%,.0f"),
-        D.COL_DELTA: st.column_config.NumberColumn("Abs Delta vs Lag 1 (kg)", format="%,.0f"),
-        D.COL_DELTA_PCT: st.column_config.NumberColumn("Delta % vs Lag 1", format="percent"),
-    }
-    for c in group_cols:
-        cfg[c] = st.column_config.TextColumn(c)
-    return cfg
+EXHIBIT_COLUMNS = [D.COL_BL, D.COL_PL, D.COL_MAT_CODE, D.COL_MATERIAL,
+                   D.COL_REGION, D.COL_ABC]
 
 
 def exception_table_block(scoped: pd.DataFrame, group_cols: list[str],
-                          title: str, caption: str, key: str) -> None:
-    st.markdown(f"### {title}")
-    st.caption(caption)
+                          display_cols: list[str], *, kicker: str, title: str,
+                          subtitle: str, key: str) -> None:
     table = D.exception_table(scoped, group_cols, TOP_N)
     if table.empty:
         st.info("Nothing changed versus lag 1 in the current scope — no exceptions to review.")
         return
-    st.caption(
-        f"Showing {len(table)} of {D.changed_group_count(scoped, group_cols):,} "
-        "combinations whose forecast moved."
+
+    display = D.split_material(table)
+    if st.session_state.get("short_names", True):
+        display = D.shorten(display, [D.COL_BL, D.COL_PL, D.COL_PARENT])
+
+    total_changed = D.changed_group_count(scoped, group_cols)
+    cols = display_cols + [D.COL_STF, D.COL_STF_L1, D.COL_DELTA, D.COL_DELTA_PCT]
+    st.markdown(
+        tables.exhibit(
+            display, cols, kicker=kicker, title=title, subtitle=subtitle,
+            threshold=DELTA_THRESHOLD,
+            footnote=f"Top {len(display)} of {total_changed:,} combinations that moved; "
+                     "ranked by absolute kg (volume weighted).",
+        ),
+        unsafe_allow_html=True,
     )
-    display = D.shorten(table, group_cols) if st.session_state.get("short_names", True) else table
-    st.dataframe(display, use_container_width=True, hide_index=True,
-                 column_config=_table_config(group_cols), height=min(640, 38 * len(display) + 40))
     st.download_button(
         "Download this table (CSV)",
         table.to_csv(index=False).encode("utf-8"),
@@ -206,17 +223,13 @@ def dashboard() -> None:
     st.title("Statistical Forecast Exception List")
 
     if uploaded is None:
-        st.info(
-            "Upload the Arkieva **Statistical Forecast Exception list** export in the "
-            "sidebar to begin. The file must contain these columns:\n\n"
-            + ", ".join(f"`{c}`" for c in D.REQUIRED_COLUMNS)
-        )
+        st.info("Please upload the excel report!")
         st.stop()
 
     try:
         df = _load(uploaded.getvalue(), uploaded.name)
     except D.DataError as exc:
-        st.error(str(exc))
+        st.error(D.user_message(exc))
         st.stop()
 
     months = D.month_options(df)
@@ -243,6 +256,9 @@ def dashboard() -> None:
         st.warning("No data in the selected month range.")
         st.stop()
 
+    horizon_label = (f"{_month_label(start)} – {_month_label(end)}"
+                     if start != end else _month_label(start))
+
     st.divider()
     kpi_row(scoped)
     st.divider()
@@ -252,21 +268,27 @@ def dashboard() -> None:
     )
 
     with tab_tables:
+        st.markdown(tables.CSS, unsafe_allow_html=True)
         exception_table_block(
             scoped,
-            [D.COL_BL, D.COL_PL, D.COL_MATERIAL, D.COL_REGION],
-            f"Top {TOP_N} changes — Material × Ship To Sub Region",
-            "Aggregated over the selected horizon and ranked by absolute kg change "
-            "(volume weighted), largest first.",
-            "top_exceptions_material_region",
+            [D.COL_BL, D.COL_PL, D.COL_MATERIAL, D.COL_REGION, D.COL_ABC],
+            EXHIBIT_COLUMNS,
+            kicker="Exhibit 1",
+            title=f"Top {TOP_N} statistical forecast changes vs Lag 1",
+            subtitle=f"Material x Ship To Sub Region · {horizon_label} · "
+                     f"changes above {DELTA_THRESHOLD:.0%} are flagged for review",
+            key="top_exceptions_material_region",
         )
         st.divider()
         exception_table_block(
             scoped,
-            [D.COL_BL, D.COL_PL, D.COL_MATERIAL, D.COL_REGION, D.COL_PARENT],
-            f"Top {TOP_N} changes — with Parent Customer",
-            "Same ranking, broken down to the parent customer that drives the change.",
-            "top_exceptions_with_parent_customer",
+            [D.COL_BL, D.COL_PL, D.COL_MATERIAL, D.COL_REGION, D.COL_ABC, D.COL_PARENT],
+            EXHIBIT_COLUMNS + [D.COL_PARENT],
+            kicker="Exhibit 2",
+            title=f"Top {TOP_N} changes by parent customer",
+            subtitle=f"Material x Ship To Sub Region x Parent Customer · {horizon_label} · "
+                     f"changes above {DELTA_THRESHOLD:.0%} are flagged for review",
+            key="top_exceptions_with_parent_customer",
         )
 
     with tab_trend:
@@ -294,8 +316,7 @@ def dashboard() -> None:
                     "history rather than re-segmentation."
                 )
             st.plotly_chart(
-                charts.material_change_bars(
-                    mix, order, st.session_state.get("short_names", True)),
+                charts.material_change_bars(mix, order),
                 use_container_width=True, config={"displayModeBar": False},
             )
             with st.expander("Show the underlying numbers"):
