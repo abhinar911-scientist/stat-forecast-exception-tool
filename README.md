@@ -206,3 +206,16 @@ tests/test_logic.py        unit tests for every metric rule
 .streamlit/config.toml     theme and upload limit (200 MB)
 .streamlit/secrets.toml    users — local only, never committed
 ```
+
+---
+
+## 7. Users configured in this bundle
+
+`.streamlit/secrets.toml` (and `.example`) already carry bcrypt hashes for four
+accounts: **Abhishek, Sara, Tonny, Michael** — the passwords agreed separately.
+Usernames are case-insensitive at sign-in.
+
+`secrets.toml` is gitignored, so it will not reach GitHub. After deploying,
+paste the same block into the Streamlit Cloud Secrets box (section 4). Have each
+person change their password once they are set up: run
+`python scripts/hash_password.py` and swap that user's `password_hash`.
